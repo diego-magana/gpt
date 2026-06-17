@@ -1,0 +1,72 @@
+[
+ {
+  "seed": 0,
+  "steps": 3000,
+  "base_loss": 1.893,
+  "top_head": [
+   0,
+   1
+  ],
+  "top_delta": 0.4933,
+  "top_prev": 0.973,
+  "top_entropy": 0.137,
+  "top_label": "previous-token",
+  "top_is_prev_token_L01": true
+ },
+ {
+  "seed": 1,
+  "steps": 3000,
+  "base_loss": 1.8948,
+  "top_head": [
+   0,
+   3
+  ],
+  "top_delta": 0.5447,
+  "top_prev": 0.967,
+  "top_entropy": 0.159,
+  "top_label": "previous-token",
+  "top_is_prev_token_L01": true
+ },
+ {
+  "seed": 2,
+  "steps": 3000,
+  "base_loss": 1.9034,
+  "top_head": [
+   0,
+   0
+  ],
+  "top_delta": 0.1232,
+  "top_prev": 0.896,
+  "top_entropy": 0.46,
+  "top_label": "previous-token",
+  "top_is_prev_token_L01": true
+ },
+ {
+  "seed": 3,
+  "steps": 3000,
+  "base_loss": 1.8821,
+  "top_head": [
+   0,
+   1
+  ],
+  "top_delta": 0.2665,
+  "top_prev": 0.943,
+  "top_entropy": 0.272,
+  "top_label": "previous-token",
+  "top_is_prev_token_L01": true
+ },
+ {
+  "seed": 1337,
+  "steps": 3000,
+  "base_loss": 1.8903,
+  "top_head": [
+   1,
+   1
+  ],
+  "top_delta": 0.43,
+  "top_prev": 0.941,
+  "top_entropy": 0.23,
+  "top_label": "previous-token",
+  "top_is_prev_token_L01": true
+ }
+]

@@ -114,90 +114,201 @@ def classify_head(s: dict) -> str:
 # --------------------------------------------------------------------------
 
 def head_ablation(model, dataset, batches):
-    """Δ mean val-loss when each (layer, head) is zeroed, vs the intact model."""
+    """Δ mean val-loss when each (layer, head) is zeroed, vs the intact model.
+
+    Returns ``base, delta, delta_sem``. The error bar is the standard error of
+    the paired per-batch difference (ablated minus intact on the *same* batch),
+    which cancels the batch-to-batch variation in the base loss and so is a
+    tighter estimate of the ablation effect than differencing two independent
+    means."""
+    def per_batch_losses(ablate):
+        out = []
+        with torch.no_grad():
+            for xb, yb in batches:
+                _, loss = model(xb, yb, ablate_heads=ablate)
+                out.append(loss.item())
+        return np.array(out)
+
+    base_losses = per_batch_losses(set())
+    base = float(base_losses.mean())
+    n_layer, n_head = model.config.n_layer, model.config.n_head
+    delta = np.zeros((n_layer, n_head))
+    delta_sem = np.zeros((n_layer, n_head))
+    for l in range(n_layer):
+        for h in range(n_head):
+            d = per_batch_losses({(l, h)}) - base_losses          # paired, per batch
+            delta[l, h] = d.mean()
+            delta_sem[l, h] = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else 0.0
+    return base, delta, delta_sem
+
+
+def redundancy_test(model, batches, a=(0, 3), b=(1, 1)):
+    """Pairwise ablation to test whether head ``a`` is functionally redundant
+    with head ``b``.
+
+    If ``a`` is a cheap-to-ablate head only because ``b`` carries a stronger copy
+    of the same signal downstream, then ablating ``a`` should cost much more once
+    ``b`` is *also* gone. We compare the marginal cost of removing ``a`` alone to
+    the marginal cost of removing ``a`` when ``b`` is already ablated. A large gap
+    supports redundancy; a small one refutes it."""
     def mean_loss(ablate):
         tot = 0.0
         with torch.no_grad():
             for xb, yb in batches:
-                _, loss = model(xb, yb, ablate_heads=ablate)
+                _, loss = model(xb, yb, ablate_heads=set(ablate))
                 tot += loss.item()
         return tot / len(batches)
 
-    base = mean_loss(set())
-    n_layer, n_head = model.config.n_layer, model.config.n_head
-    delta = np.zeros((n_layer, n_head))
-    for l in range(n_layer):
-        for h in range(n_head):
-            delta[l, h] = mean_loss({(l, h)}) - base
-    return base, delta
+    base = mean_loss([])
+    la = mean_loss([a])
+    lb = mean_loss([b])
+    lab = mean_loss([a, b])
+    return {
+        "a": a, "b": b, "base": base,
+        "ablate_a": la, "ablate_b": lb, "ablate_both": lab,
+        "marg_a_alone": la - base,        # cost of removing a with everything else intact
+        "marg_a_given_b": lab - lb,       # cost of removing a once b is already gone
+    }
 
 
 # --------------------------------------------------------------------------
 # 3. Activation patching (causal interchange intervention)
 # --------------------------------------------------------------------------
 
-def activation_patching(model, dataset, n_examples=192, corrupt_pos=None, seed=7):
-    """Residual-stream interchange interventions.
+def _logit_diff(logits, clean_top, corrupt_top):
+    """Contrastive metric: how much the final-position logits favor the clean
+    answer over the token the corruption pushed. Less sensitive to overall
+    distribution shifts than the log-prob of a single token."""
+    return (logits[0, -1, clean_top] - logits[0, -1, corrupt_top]).item()
 
-    For each example we take a clean context, corrupt one token a few positions
-    from the end, and ask how much patching the *clean* residual-stream vector at
-    each (residual-index, position) back into the corrupted run restores the
-    model's clean prediction at the final position.
 
-    metric = log-prob the run assigns to the clean run's top-1 next token.
-    recovery = (patched - corrupt) / (clean - corrupt), averaged over examples.
+def activation_patching(model, dataset, n_examples=256, corrupt_pos=None, seed=7):
+    """Residual-stream interchange interventions, localized to (layer, position).
 
-    Corrupting a token shortly before the end (default ``T-2``) means its
-    influence must travel forward to the final position through attention, so the
-    recovery map can reveal *where* — which layer and position — that information
-    is carried.
+    For each example: take a clean context, corrupt one token a few positions
+    from the end, and patch the *clean* residual-stream vector at each
+    (residual-index, position) back into the corrupted run, measuring how much of
+    the clean prediction returns.
+
+    Metric is a contrastive logit difference (clean top token vs. the token the
+    corruption promotes). Only examples where the corruption actually *flips* the
+    top-1 prediction are used — a principled, reportable selection rather than an
+    arbitrary threshold. ``recovery = (patched - corrupt) / (clean - corrupt)``.
+
+    Returns ``rec, rec_sem, used, corrupt_pos`` where the maps are
+    ``(n_layer+1, T)``. Note this patches the residual *sum* at a position, so it
+    localizes information to a (layer, position) but does not isolate a head — see
+    :func:`head_patching` for that.
     """
     T = model.config.block_size
     if corrupt_pos is None:
         corrupt_pos = T - 2
     V = model.config.vocab_size
     n_layer = model.config.n_layer
-
-    ds = dataset
     g = torch.Generator(); g.manual_seed(seed)
-    data = ds.val_data
+    data = dataset.val_data
 
-    rec = np.zeros((n_layer + 1, T))
+    samples = {(k, p): [] for k in range(n_layer + 1) for p in range(corrupt_pos, T)}
     used = 0
     with torch.no_grad():
         for _ in range(n_examples):
             i = torch.randint(len(data) - T - 1, (1,), generator=g).item()
-            x = data[i : i + T].clone().unsqueeze(0)            # (1, T)
-
-            # clean run + cache
+            x = data[i : i + T].clone().unsqueeze(0)
             logits_c, _, cache = model(x, return_cache=True)
-            lp_clean = F.log_softmax(logits_c[0, -1], dim=-1)
-            tok = int(lp_clean.argmax())
-            m_clean = lp_clean[tok].item()
+            clean_top = int(logits_c[0, -1].argmax())
 
-            # corrupt one token (different id) and run
             xc = x.clone()
             new = torch.randint(V, (1,), generator=g).item()
             while new == int(x[0, corrupt_pos]):
                 new = torch.randint(V, (1,), generator=g).item()
             xc[0, corrupt_pos] = new
             logits_k, _ = model(xc)
-            m_corrupt = F.log_softmax(logits_k[0, -1], dim=-1)[tok].item()
-
+            corrupt_top = int(logits_k[0, -1].argmax())
+            if corrupt_top == clean_top:        # corruption left the prediction unchanged
+                continue
+            m_clean = _logit_diff(logits_c, clean_top, corrupt_top)
+            m_corrupt = _logit_diff(logits_k, clean_top, corrupt_top)
             denom = m_clean - m_corrupt
-            if denom < 0.20:        # corruption barely mattered; skip noisy ratio
+            if denom < 1e-3:
                 continue
             used += 1
-
             for k in range(n_layer + 1):
-                for p in range(corrupt_pos, T):   # only positions the corruption can reach
-                    vec = cache.resid[k][0, p]    # clean activation (C,)
-                    logits_p, _ = model(xc, patch={(k, p): vec})
-                    m_p = F.log_softmax(logits_p[0, -1], dim=-1)[tok].item()
-                    rec[k, p] += (m_p - m_corrupt) / denom
+                for p in range(corrupt_pos, T):
+                    logits_p, _ = model(xc, patch={(k, p): cache.resid[k][0, p]})
+                    samples[(k, p)].append(
+                        (_logit_diff(logits_p, clean_top, corrupt_top) - m_corrupt) / denom
+                    )
 
-    rec /= max(used, 1)
-    return rec, used, corrupt_pos
+    rec = np.zeros((n_layer + 1, T))
+    rec_sem = np.zeros((n_layer + 1, T))
+    for (k, p), vals in samples.items():
+        arr = np.array(vals) if vals else np.array([0.0])
+        rec[k, p] = arr.mean()
+        rec_sem[k, p] = arr.std(ddof=1) / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
+    return rec, rec_sem, used, corrupt_pos
+
+
+def head_patching(model, dataset, n_examples=256, corrupt_pos=None, seed=7):
+    """Head-level interchange intervention — the test residual patching cannot do.
+
+    Same clean/corrupt setup as :func:`activation_patching`, but instead of
+    patching the residual stream at a position, we splice a single head's *clean*
+    output into the corrupted run (all positions) and measure recovery. Because
+    only that one head's contribution is replaced, the recovered prediction is
+    attributable to that head alone — this is what isolates L1 H1 rather than
+    inferring it from the coincidence of "block 1 matters" and "L1 H1 ablates
+    hardest."
+
+    Returns ``rec, rec_sem, used, corrupt_pos`` with maps shaped
+    ``(n_layer, n_head)``.
+    """
+    T = model.config.block_size
+    if corrupt_pos is None:
+        corrupt_pos = T - 2
+    V = model.config.vocab_size
+    n_layer, n_head = model.config.n_layer, model.config.n_head
+    g = torch.Generator(); g.manual_seed(seed)
+    data = dataset.val_data
+
+    samples = [[[] for _ in range(n_head)] for _ in range(n_layer)]
+    used = 0
+    with torch.no_grad():
+        for _ in range(n_examples):
+            i = torch.randint(len(data) - T - 1, (1,), generator=g).item()
+            x = data[i : i + T].clone().unsqueeze(0)
+            logits_c, _, cache = model(x, return_cache=True)
+            clean_top = int(logits_c[0, -1].argmax())
+
+            xc = x.clone()
+            new = torch.randint(V, (1,), generator=g).item()
+            while new == int(x[0, corrupt_pos]):
+                new = torch.randint(V, (1,), generator=g).item()
+            xc[0, corrupt_pos] = new
+            logits_k, _ = model(xc)
+            corrupt_top = int(logits_k[0, -1].argmax())
+            if corrupt_top == clean_top:
+                continue
+            m_clean = _logit_diff(logits_c, clean_top, corrupt_top)
+            m_corrupt = _logit_diff(logits_k, clean_top, corrupt_top)
+            denom = m_clean - m_corrupt
+            if denom < 1e-3:
+                continue
+            used += 1
+            for l in range(n_layer):
+                for h in range(n_head):
+                    logits_p, _ = model(xc, patch_heads={(l, h): cache.head_out[l][:, h]})
+                    samples[l][h].append(
+                        (_logit_diff(logits_p, clean_top, corrupt_top) - m_corrupt) / denom
+                    )
+
+    rec = np.zeros((n_layer, n_head))
+    rec_sem = np.zeros((n_layer, n_head))
+    for l in range(n_layer):
+        for h in range(n_head):
+            arr = np.array(samples[l][h]) if samples[l][h] else np.array([0.0])
+            rec[l, h] = arr.mean()
+            rec_sem[l, h] = arr.std(ddof=1) / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
+    return rec, rec_sem, used, corrupt_pos
 
 
 # --------------------------------------------------------------------------

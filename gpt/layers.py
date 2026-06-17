@@ -35,11 +35,15 @@ class ActivationCache:
     of that idea. ``attn[layer]`` holds the per-head attention weights of block
     ``layer``; ``resid[k]`` holds the residual stream *entering* block ``k``
     (with ``resid[0]`` the post-embedding stream and ``resid[n_layer]`` the final
-    pre-``ln_f`` stream). The analysis reads these instead of re-deriving them.
+    pre-``ln_f`` stream); ``head_out[layer]`` holds each head's output *before*
+    the output projection, which is what a head actually writes and therefore the
+    thing to splice in a head-level interchange intervention. The analysis reads
+    these instead of re-deriving them.
     """
 
-    attn: dict[int, torch.Tensor] = field(default_factory=dict)    # layer -> (B, n_head, T, T)
-    resid: dict[int, torch.Tensor] = field(default_factory=dict)   # k -> (B, T, C)
+    attn: dict[int, torch.Tensor] = field(default_factory=dict)      # layer -> (B, n_head, T, T)
+    resid: dict[int, torch.Tensor] = field(default_factory=dict)     # k -> (B, T, C)
+    head_out: dict[int, torch.Tensor] = field(default_factory=dict)  # layer -> (B, n_head, T, head_size)
 
 
 class Head(nn.Module):
@@ -130,12 +134,15 @@ class MultiHeadAttention(nn.Module):
     then mixes the per-head results back into the model dimension so the residual
     stream stays width-``n_embd``.
 
-    The head-ablation hook
-    ----------------------
+    The head-ablation and head-patching hooks
+    -----------------------------------------
     ``ablate`` is a set of head indices whose outputs are zeroed before
-    concatenation. Zeroing a head's contribution and re-measuring the loss is a
-    genuine intervention — it reports how much the model's predictions *depend*
-    on that head, which correlational attention maps cannot tell you.
+    concatenation — it reports how much the model *depends* on a head. ``patch_
+    heads`` goes further: it is a dict ``{head_idx: tensor}`` that *replaces* a
+    head's output with one supplied from elsewhere (typically the same head's
+    output on a clean input). Splicing one head's clean output into an otherwise
+    corrupted run isolates that single head's causal contribution, which ablation
+    (a coarse on/off) and residual-stream patching (which mixes all heads) cannot.
     """
 
     def __init__(self, n_embd: int, n_head: int, head_size: int, block_size: int, dropout: float):
@@ -151,8 +158,10 @@ class MultiHeadAttention(nn.Module):
         x: torch.Tensor,
         return_attn: bool = False,
         ablate: set[int] | None = None,
+        patch_heads: dict[int, torch.Tensor] | None = None,
     ):
         ablate = ablate or set()
+        patch_heads = patch_heads or {}
         outs, attns = [], []
         for h_idx, head in enumerate(self.heads):
             if return_attn:
@@ -160,15 +169,18 @@ class MultiHeadAttention(nn.Module):
                 attns.append(a)
             else:
                 o = head(x)                         # (B, T, head_size)
-            if h_idx in ablate:
+            if h_idx in patch_heads:
+                o = patch_heads[h_idx]              # splice in a supplied (clean) head output
+            elif h_idx in ablate:
                 o = torch.zeros_like(o)             # knock this head out of the sum
             outs.append(o)
 
+        head_outs = torch.stack(outs, dim=1)        # (B, n_head, T, head_size)
         out = torch.cat(outs, dim=-1)               # (B, T, n_head*head_size) == (B, T, n_embd)
         out = self.dropout(self.proj(out))          # (B, T, n_embd)
         if return_attn:
             stacked = torch.stack(attns, dim=1)     # (B, n_head, T, T)
-            return out, stacked
+            return out, stacked, head_outs
         return out
 
 
@@ -255,14 +267,17 @@ class Block(nn.Module):
         x: torch.Tensor,
         return_attn: bool = False,
         ablate: set[int] | None = None,
+        patch_heads: dict[int, torch.Tensor] | None = None,
     ):
         if return_attn:
-            sa_out, attn = self.sa(self.ln1(x), return_attn=True, ablate=ablate)
+            sa_out, attn, head_outs = self.sa(
+                self.ln1(x), return_attn=True, ablate=ablate, patch_heads=patch_heads
+            )
         else:
-            sa_out = self.sa(self.ln1(x), ablate=ablate)
-            attn = None
+            sa_out = self.sa(self.ln1(x), ablate=ablate, patch_heads=patch_heads)
+            attn = head_outs = None
         x = x + sa_out                       # (B, T, C) residual after attention
         x = x + self.ffwd(self.ln2(x))       # (B, T, C) residual after FFN
         if return_attn:
-            return x, attn
+            return x, attn, head_outs
         return x

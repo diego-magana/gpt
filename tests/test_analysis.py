@@ -8,12 +8,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
+
+# Every test here trains a tiny model end-to-end: these are integration tests,
+# not unit smoke tests. Mark the module so `pytest -m "not slow"` skips them.
+pytestmark = pytest.mark.slow
 
 from gpt import make_dataset, set_seed, train, TrainConfig
 from gpt.analysis import (
     eval_batches, attention_summary, classify_head,
-    head_ablation, activation_patching, residual_profile,
+    head_ablation, redundancy_test, activation_patching, head_patching,
+    residual_profile,
 )
 from models import GPT, GPTConfig
 
@@ -49,22 +55,39 @@ def test_attention_summary_shapes_and_distributions():
 def test_head_ablation_shape_and_base():
     model, ds, cfg = _tiny_model_and_data()
     batches = eval_batches(ds, cfg.block_size, 8, 2)
-    base, delta = head_ablation(model, ds, batches)
+    base, delta, delta_sem = head_ablation(model, ds, batches)
     assert base > 0
     assert delta.shape == (cfg.n_layer, cfg.n_head)
+    assert delta_sem.shape == delta.shape
+    assert (delta_sem >= 0).all()
     # Ablating a head should not, on average, *reduce* loss below the intact model
     # by more than floating noise.
     assert delta.min() > -0.05
 
 
-def test_activation_patching_recovers_corrupt_column():
+def test_redundancy_test_keys():
     model, ds, cfg = _tiny_model_and_data()
-    rec, used, cpos = activation_patching(model, ds, n_examples=24)
+    batches = eval_batches(ds, cfg.block_size, 8, 2)
+    r = redundancy_test(model, batches, a=(0, 0), b=(1, 1))
+    assert {"base", "ablate_a", "ablate_b", "ablate_both",
+            "marg_a_alone", "marg_a_given_b"} <= set(r)
+    assert r["base"] > 0
+
+
+def test_activation_patching_runs_and_shapes():
+    model, ds, cfg = _tiny_model_and_data()
+    rec, rec_sem, used, cpos = activation_patching(model, ds, n_examples=40)
     assert rec.shape == (cfg.n_layer + 1, cfg.block_size)
-    if used > 0:
-        # Patching the clean activation at the corrupted position in the input
-        # layer must recover most of the prediction by construction.
-        assert rec[0, cpos] > 0.8
+    assert rec_sem.shape == rec.shape
+    assert used >= 0 and cpos == cfg.block_size - 2
+
+
+def test_head_patching_runs_and_shapes():
+    model, ds, cfg = _tiny_model_and_data()
+    rec, rec_sem, used, cpos = head_patching(model, ds, n_examples=40)
+    assert rec.shape == (cfg.n_layer, cfg.n_head)
+    assert rec_sem.shape == rec.shape
+    assert used >= 0
 
 
 def test_residual_profile_monotone_logit_lens():

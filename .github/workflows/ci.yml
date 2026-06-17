@@ -13,7 +13,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy matplotlib pytest
+          pip install numpy matplotlib pytest nbconvert jupyter
           pip install -e .
       - name: Run tests
         run: pytest tests/ -v
+      - name: Smoke-execute the analysis notebooks
+        # These load the committed checkpoint (no training) and exercise the full
+        # analysis pipeline, so they guard the notebooks against code drift. The
+        # progression notebooks 01-03 train and are excluded for runtime.
+        run: |
+          jupyter nbconvert --to notebook --execute --inplace \
+            notebooks/progression/04_full_gpt.ipynb \
+            notebooks/05_attention_analysis.ipynb

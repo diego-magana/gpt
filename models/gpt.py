@@ -93,6 +93,7 @@ class GPT(nn.Module):
         return_cache: bool = False,
         ablate_heads: set[tuple[int, int]] | None = None,
         patch: dict[tuple[int, int], torch.Tensor] | None = None,
+        patch_heads: dict[tuple[int, int], torch.Tensor] | None = None,
     ):
         """Run the model, optionally capturing/intervening on internals.
 
@@ -102,17 +103,22 @@ class GPT(nn.Module):
             If given, also return the mean cross-entropy loss.
         return_cache
             If True, return an :class:`ActivationCache` of per-layer attention
-            ``(B, n_head, T, T)`` and the residual stream entering each block.
+            ``(B, n_head, T, T)``, the residual stream entering each block, and
+            each layer's per-head outputs ``(B, n_head, T, head_size)``.
         ablate_heads
             Set of ``(layer, head)`` pairs whose attention outputs are zeroed —
-            the head-importance intervention.
+            the coarse head-importance intervention.
         patch
             Dict mapping ``(k, pos) -> vector`` that overwrites the residual
             stream at residual index ``k`` (``0`` = post-embedding, ``i+1`` =
-            output of block ``i``) and position ``pos`` with ``vector`` (shape
-            ``(n_embd,)`` or ``(B, n_embd)``). This is the activation-patching
-            primitive: splice a clean activation into a corrupted run and measure
-            how much the prediction recovers.
+            output of block ``i``) and position ``pos``. Localizes information to
+            a (layer, position) but mixes every head's contribution at that site.
+        patch_heads
+            Dict mapping ``(layer, head) -> tensor`` of shape
+            ``(B, T, head_size)`` that *replaces* a single head's output with the
+            supplied one. Unlike ``patch``, this isolates one head: splice its
+            clean output into a corrupted run and the recovered prediction is
+            attributable to that head alone.
 
         Shape walk
         ----------
@@ -126,6 +132,7 @@ class GPT(nn.Module):
         device = idx.device
         ablate_heads = ablate_heads or set()
         patch = patch or {}
+        patch_heads = patch_heads or {}
         cache = ActivationCache() if return_cache else None
 
         def maybe_patch(x: torch.Tensor, k: int) -> torch.Tensor:
@@ -146,11 +153,16 @@ class GPT(nn.Module):
             cache.resid[0] = x.detach()
 
         for i, block in enumerate(self.blocks):
-            # Heads to ablate in *this* layer.
+            # Per-layer interventions for *this* block.
             layer_ablate = {h for (l, h) in ablate_heads if l == i}
-            if cache is not None:
-                x, attn = block(x, return_attn=True, ablate=layer_ablate)
-                cache.attn[i] = attn.detach()                           # (B, n_head, T, T)
+            layer_patch_heads = {h: v for (l, h), v in patch_heads.items() if l == i}
+            if cache is not None or layer_patch_heads:
+                x, attn, head_outs = block(
+                    x, return_attn=True, ablate=layer_ablate, patch_heads=layer_patch_heads
+                )
+                if cache is not None:
+                    cache.attn[i] = attn.detach()                       # (B, n_head, T, T)
+                    cache.head_out[i] = head_outs.detach()              # (B, n_head, T, head_size)
             else:
                 x = block(x, ablate=layer_ablate)
             x = maybe_patch(x, i + 1)

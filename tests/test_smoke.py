@@ -109,6 +109,25 @@ def test_clean_activation_patch_is_noop():
     assert torch.allclose(base_logits, patched_logits, atol=1e-6)
 
 
+def test_clean_head_patch_is_noop():
+    """The head-level analogue: splicing a head's own clean output back in must
+    be an exact no-op. This is what makes the head-patching recovery numbers
+    trustworthy as a per-head causal measure."""
+    ds = _small_dataset()
+    cfg = GPTConfig(vocab_size=ds.vocab_size, block_size=16, n_embd=32, n_head=4, n_layer=2)
+    model = GPT(cfg)
+    g = set_seed(0)
+    xb, yb = get_batch(ds, "train", cfg.block_size, 4, "cpu", g)
+    base_logits, _, cache = model(xb, return_cache=True)
+    clean_head = cache.head_out[1][:, 1]              # (B, T, head_size) for L1 H1
+    patched_logits, _ = model(xb, patch_heads={(1, 1): clean_head})
+    assert torch.allclose(base_logits, patched_logits, atol=1e-6)
+    # Zeroing a head via patch_heads must equal ablating it.
+    _, loss_zero = model(xb, yb, patch_heads={(1, 1): torch.zeros_like(clean_head)})
+    _, loss_abl = model(xb, yb, ablate_heads={(1, 1)})
+    assert abs(loss_zero.item() - loss_abl.item()) < 1e-6
+
+
 def test_head_ablation_changes_loss():
     """Zeroing a head must perturb the loss; a no-op would mean the ablation hook
     is silently disconnected from the forward pass."""

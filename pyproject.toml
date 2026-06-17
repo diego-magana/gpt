@@ -24,3 +24,6 @@ packages = ["gpt", "models"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: integration tests that train a model (deselect with -m 'not slow')",
+]
