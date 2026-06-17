@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+build/
+dist/
+.venv/
+venv/
+
+# Checkpoints: exclude by default, but commit the analysis checkpoint so
+# notebooks/05_attention_analysis.ipynb is standalone-reproducible.
+*.pth
+!assets/gpt.pth

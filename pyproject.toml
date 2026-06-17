@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpt-shakespeare"
+version = "0.1.0"
+description = "Modular, instrumented re-implementation of Karpathy's 'Let's build GPT' capstone, with an attention-head probing and activation-patching analysis."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Diego Magana" }]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "jupyter>=1.0", "nbconvert>=7.0"]
+
+[tool.setuptools]
+packages = ["gpt", "models"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
