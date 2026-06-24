@@ -97,9 +97,13 @@ def attention_summary(model, batches):
 def classify_head(s: dict) -> str:
     """Label a head from its statistics with explicit, inspectable thresholds.
     Labels are descriptive shorthand for the dominant tendency, not claims about
-    a single causal role."""
+    a single causal role. The "sharp" tier separates heads that put most of their
+    weight on the previous token (the two that matter here) from heads that merely
+    lean that way."""
+    if s["prev"] > 0.70:
+        return "previous-token (sharp)"
     if s["prev"] > 0.35:
-        return "previous-token"
+        return "previous-token (weak)"
     if s["first"] > 0.35:
         return "first-token / sink"
     if s["self"] > 0.45:

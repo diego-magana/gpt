@@ -22,11 +22,12 @@ end of makemore.
 
 ## What I found
 
-I trained the full model to convergence and ran six analyses on it — two that just
-look at the network (attention patterns, the residual stream) and four that
+I trained the full model to convergence and ran seven analyses on it — two that just
+look at the network (attention patterns, the residual stream) and five that
 intervene on it (head ablation, a pairwise-ablation redundancy test, residual
-patching, and head patching). The interesting part is that looking and intervening
-disagree, and the disagreement is where the real result is.
+patching, head patching, and a corruption-distance sweep). The interesting part is
+that looking and intervening disagree, and the disagreement is where the real result
+is.
 
 **The model has two heads that look like previous-token heads.** Averaging attention
 over 512 held-out sequences, layer 0 is mostly diffuse, layer 1 leans entirely on
@@ -54,6 +55,8 @@ L0 H3 on its own costs ≈ 0.04, but ablating it once L1 H1 is *already* ablated
 ≈ 0.23 — almost six times as much. L0 H3 isn't dead weight; it's a backup
 previous-token head whose contribution is masked by the stronger one.
 
+![Redundancy](assets/redundancy.png)
+
 **Residual patching shows where the information flows.** I take a clean context,
 corrupt the character two positions before the end, and patch the clean
 residual-stream activations back in one site at a time, measuring how much of the
@@ -76,6 +79,19 @@ inferring L1 H1 from "block 1 matters" plus "L1 H1 ablates hardest," I'm routing
 clean output into a broken run and watching the prediction come back.
 
 ![Head patching](assets/head_patching.png)
+
+**How far back does the mechanism reach?** Everything above corrupts the token one
+position back, which probes the previous-token path by construction — so I swept the
+corruption distance to check the boundary. The model's dependence falls steadily with
+distance (the flip rate drops from ≈ 0.73 one position back to ≈ 0.19 five positions
+back — it leans hardest on the nearest token). And L1 H1 keeps carrying the signal
+past distance 1, staying the top head at distances 2–3: not because it reads two
+positions back, but because previous-token copies *compose* — the token one-back
+already encodes the token two-back, and L1 H1 copies that forward. There's no
+dedicated long-range head; by distances 4–5 the carrier shifts and the estimate goes
+noisy as few predictions still depend on it.
+
+![Distance sweep](assets/distance_sweep.png)
 
 **The prediction sharpens steadily with depth.** Reading each layer's residual stream
 through the final unembedding (the logit lens), top-1 next-character accuracy climbs
@@ -241,4 +257,4 @@ from scratch, in code, spelled out"* and
 I added is the interpretability instrumentation (activation cache, head-ablation,
 residual- and head-patching APIs), the reproducibility engineering (isolated
 evaluation, self-describing checkpoints, seeded interventions with error bars), and
-the six-part analysis this README leads with.
+the seven-part analysis this README leads with.
