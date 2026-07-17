@@ -345,3 +345,97 @@ def residual_profile(model, batches):
                 acc[k] += (lt.argmax(-1) == tgt).sum().item()
             ntok += B * T
     return norms / ntok, ce / ntok, acc / ntok
+
+
+# --------------------------------------------------------------------------
+# 6. Weight-space circuits (QK / OV) — no data, no forward pass
+# --------------------------------------------------------------------------
+
+def _head_weights(model, layer, head):
+    """(W_Q, W_K, W_V, W_O_slice) for one head. W_O_slice is the block of the
+    output projection that reads this head's slot in the concatenated output."""
+    h = model.blocks[layer].sa.heads[head]
+    hs = h.query.weight.shape[0]
+    W_O = model.blocks[layer].sa.proj.weight[:, head * hs:(head + 1) * hs]   # (C, hs)
+    return h.query.weight, h.key.weight, h.value.weight, W_O
+
+
+def qk_positional_circuit(model, layer, head):
+    """Attention logits this head would produce from *position alone*.
+
+    Runs the QK circuit on the position embeddings with the token embeddings left
+    out: ``(P W_Q)(P W_K)^T / sqrt(head_size)``. Every behavioral measure so far
+    (attention maps, ablation, patching) reads the network's output on data; this
+    reads the weights directly, so a previous-token pattern here is a property of
+    the learned parameters rather than of the corpus. Returns ``(T, T)``.
+    """
+    P = model.position_embedding_table.weight              # (T, C)
+    W_Q, W_K, _, _ = _head_weights(model, layer, head)
+    hs = W_Q.shape[0]
+    with torch.no_grad():
+        return ((P @ W_Q.T) @ (P @ W_K.T).T) / (hs ** 0.5)  # (T, T)
+
+
+def qk_offset_profile(model, layer, head):
+    """Where the positional QK circuit points, per query position.
+
+    For each query ``i`` takes the argmax key over the causal window ``j <= i`` and
+    records the offset ``i - j``. A previous-token head lands on offset 1 almost
+    everywhere. Returns ``dict(offsets, frac_offset_one, mean_offset)``.
+    """
+    S = qk_positional_circuit(model, layer, head)
+    T = S.shape[0]
+    offsets = np.array([i - int(S[i, :i + 1].argmax()) for i in range(1, T)])
+    return {
+        "offsets": offsets,
+        "frac_offset_one": float((offsets == 1).mean()),
+        "mean_offset": float(offsets.mean()),
+    }
+
+
+def ov_circuit(model, layer, head):
+    """What the head writes into the residual stream for each attended token.
+
+    ``E W_V W_O`` gives the residual-stream write per vocabulary token ``(V, C)``;
+    composing with the unembedding gives its direct effect on logits ``(V, V)``.
+    Returns ``(write, to_logits)``. A head that copies the attended token to the
+    output would show a dominant diagonal in ``to_logits``.
+    """
+    E = model.token_embedding_table.weight                 # (V, C)
+    U = model.lm_head.weight                               # (V, C)
+    _, _, W_V, W_O = _head_weights(model, layer, head)
+    with torch.no_grad():
+        write = (E @ W_V.T) @ W_O.T                        # (V, C)
+        return write, write @ U.T                          # (V, C), (V, V)
+
+
+def ov_copy_profile(model, layer, head):
+    """Is the OV circuit a copy, and does it preserve token identity at all?
+
+    Three diagnostics. ``top1_logit``: how often attending to token *i* most raises
+    logit *i* (a direct-path copier scores ~1). ``top1_embed``: how often the write
+    aligns most with token *i*'s own embedding (a copier writing in the embedding
+    basis scores ~1). ``sep_ratio``: mean nearest-neighbour distance over mean
+    pairwise distance among the ``V`` written vectors — near 0 means the writes
+    collapse and token identity is destroyed; well above 0 means the tokens stay
+    distinct (information preserved, whatever basis it lives in).
+    """
+    E = model.token_embedding_table.weight
+    write, to_logits = ov_circuit(model, layer, head)
+    with torch.no_grad():
+        V = E.shape[0]
+        top1_logit = float(np.mean([int(to_logits[i].argmax()) == i for i in range(V)]))
+        S = (F.normalize(write, dim=1) @ F.normalize(E, dim=1).T)
+        top1_embed = float(np.mean([int(S[i].argmax()) == i for i in range(V)]))
+        W = write.numpy()
+        D = np.linalg.norm(W[:, None, :] - W[None, :, :], axis=-1)
+        np.fill_diagonal(D, np.inf)
+        nn_mean = float(D.min(1).mean())
+        D[np.isinf(D)] = np.nan
+        pair_mean = float(np.nanmean(D))
+        return {
+            "top1_logit": top1_logit,
+            "top1_embed": top1_embed,
+            "rank": int(np.linalg.matrix_rank(W, tol=1e-4)),
+            "sep_ratio": nn_mean / pair_mean,
+        }

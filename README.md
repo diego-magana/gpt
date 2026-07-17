@@ -7,25 +7,29 @@ apart to see how the trained model actually works.
 
 The short version of what I found: in this 4-layer, 4-head character model, almost
 all of the predictive work runs through a single attention head — layer 1, head 1 —
-which copies the previous character into the position that predicts the next one.
-Two heads *look* like they do that job; only one of them actually matters, and it
-took intervening on the network to tell them apart. Retrain from a different seed
-and the same kind of head takes over — just not always at the same index.
+which fetches the previous character into the position that predicts the next one.
+Two heads *look* like they do that job — and their weights say they compute the same
+thing — but only one of them actually matters, and it took intervening on the network
+to tell them apart. Retrain from a different seed and the same kind of head takes
+over, just not always at the same index.
 
 This is the third in a series after
 [micrograd](https://github.com/diego-magana/micrograd) (a scalar autograd engine)
 and [makemore](https://github.com/diego-magana/makemore) (n-gram to WaveNet
-character models). The patching analysis here is the one I pointed forward to at the
-end of makemore.
+character models). makemore ends by showing that a gradient-based context measure
+comes back flat while a causal ablation shows the model leaning hard on the most
+recent character — the same recency, found the same way, one architecture down. The
+transformer-circuit methods here are what I pointed forward to at the end of it.
 
 ---
 
 ## What I found
 
-I trained the full model to convergence and ran seven analyses on it — two that just
-look at the network (attention patterns, the residual stream) and five that
-intervene on it (head ablation, a pairwise-ablation redundancy test, residual
-patching, head patching, and a corruption-distance sweep). The interesting part is
+I trained the full model to convergence and ran eight analyses on it — two that just
+look at the network (attention patterns, the residual stream), five that intervene on
+it (head ablation, a pairwise-ablation redundancy test, residual patching, head
+patching, and a corruption-distance sweep), and one that reads the weights directly
+(the QK/OV circuits). The interesting part is
 that looking and intervening disagree, and the disagreement is where the real result
 is.
 
@@ -80,6 +84,29 @@ clean output into a broken run and watching the prediction come back.
 
 ![Head patching](assets/head_patching.png)
 
+**The weights say the same thing — and correct my language.** Everything above reads
+the network's behavior on data. The weights are stricter evidence, because a pattern
+in the parameters can't be a corpus artifact. L1 H1's **QK circuit**, computed from
+the position embeddings alone with no data and no forward pass, points exactly one
+position back for **94%** of query positions — so "previous-token head" is what the
+learned weights compute, not just how the head behaves on Shakespeare. L0 H3 scores
+**1.00**: an even purer previous-token circuit than the head doing all the work. That
+is the redundancy result arriving from a completely independent direction — the two
+heads implement the *same* positional map, which is precisely why the model can lean
+on one and leave the other nearly free. Nothing else clears 0.52.
+
+The **OV circuit** is where I had to correct myself. A true copier would push logit
+*x* up when it attends to token *x*; the OV matrix has no such diagonal (top-1
+agreement ≈ 0.02). But it doesn't destroy the information either — the map is full
+head-rank and sends the 65 tokens to well-separated vectors. So the head *preserves
+which token it attended to and writes it into a learned subspace*, not into the
+unembedding direction. L1 H1 is a previous-token **mover**, not a direct-path copier
+— which is exactly why patching it alone recovers 0.51 and not 1.0: layers 2–3 have
+to decode what it wrote. The head fetches the character; the rest of the network
+turns it into a prediction.
+
+![QK/OV circuits](assets/qk_ov_circuits.png)
+
 **How far back does the mechanism reach?** Everything above corrupts the token one
 position back, which probes the previous-token path by construction — so I swept the
 corruption distance to check the boundary. The model's dependence falls steadily with
@@ -112,10 +139,10 @@ the head index doesn't. "L1 H1 carries the prediction" is true of *this* model; 
 durable statement is "training reliably builds a previous-token head, and the model
 leans on it."
 
-What this doesn't show, and the three things I'd want before calling it a circuit
-(path patching, the QK/OV weight-space read, and anything non-local — `block_size=32`
-and 0.21M parameters leave no room for induction heads, so this is the one mechanism
-a tiny local model *can* have) are spelled out at the end of
+What this doesn't show, and the two things I'd want before calling it a circuit
+(path patching to decompose the downstream path the OV circuit implies, and anything
+non-local — `block_size=32` and 0.21M parameters leave no room for induction heads, so
+this is the one mechanism a tiny local model *can* have) are spelled out at the end of
 [`notebooks/05_attention_analysis.ipynb`](notebooks/05_attention_analysis.ipynb).
 
 ---
@@ -164,7 +191,7 @@ analyses rest on, that splicing a run's own clean activations (residual *or* a s
 head's output) back in changes nothing:
 
 ```bash
-pytest                                 # 16 tests, runnable from any directory
+pytest                                 # 18 tests, runnable from any directory
 pytest -m "not slow"                   # 10 fast tests; skips the training-based ones
 ```
 
@@ -183,14 +210,15 @@ gpt/
 │   ├── data.py              char tokenizer, train/val split, reproducible batching
 │   ├── layers.py            Head, MultiHeadAttention, FeedForward, Block + ActivationCache
 │   ├── train.py             training loop, isolated eval, generation, seeding
-│   └── analysis.py          attention stats, ablation + redundancy, residual & head patching, logit lens
+│   └── analysis.py          attention stats, ablation + redundancy, residual & head
+│                            patching, QK/OV circuits, logit lens
 ├── models/
 │   ├── bigram.py            the baseline
 │   └── gpt.py               GPT + GPTConfig, instrumented forward, checkpointing
 ├── notebooks/
 │   ├── 05_attention_analysis.ipynb     ← the analysis (start here)
 │   └── progression/         01 bigram → 02 single head → 03 multihead+FFN → 04 full GPT
-├── assets/                  gpt.pth, loss history, analysis_summary + seed_robustness JSON, figures
+├── assets/                  gpt.pth, loss history, seed_robustness.json, figures
 ├── data/                    input.txt (Tiny Shakespeare)
 ├── tests/                   test_smoke.py (fast invariants), test_analysis.py (slow integration)
 ├── train_gpt.py             reproduce the 30k analysis checkpoint
@@ -255,6 +283,6 @@ The architecture and training recipe follow Andrej Karpathy's *"Let's build GPT:
 from scratch, in code, spelled out"* and
 [nanoGPT](https://github.com/karpathy/nanoGPT); the corpus is Tiny Shakespeare. What
 I added is the interpretability instrumentation (activation cache, head-ablation,
-residual- and head-patching APIs), the reproducibility engineering (isolated
-evaluation, self-describing checkpoints, seeded interventions with error bars), and
-the seven-part analysis this README leads with.
+residual- and head-patching APIs, QK/OV weight-space circuits), the reproducibility
+engineering (isolated evaluation, self-describing checkpoints, seeded interventions
+with error bars), and the eight-part analysis this README leads with.

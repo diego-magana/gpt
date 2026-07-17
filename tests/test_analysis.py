@@ -19,7 +19,8 @@ from gpt import make_dataset, set_seed, train, TrainConfig
 from gpt.analysis import (
     eval_batches, attention_summary, classify_head,
     head_ablation, redundancy_test, activation_patching, head_patching,
-    residual_profile,
+    residual_profile, qk_positional_circuit, qk_offset_profile,
+    ov_circuit, ov_copy_profile,
 )
 from models import GPT, GPTConfig
 
@@ -98,3 +99,25 @@ def test_residual_profile_monotone_logit_lens():
     # The logit-lens readout at the final depth equals the model's own loss, so CE
     # at the last index should be the smallest along the depth axis.
     assert ce[-1] <= ce[0] + 1e-6
+
+
+def test_qk_positional_circuit_shape_and_causal_offsets():
+    """The QK circuit reads weights only — no data, no forward pass — so it must
+    return a (T, T) positional score matrix and offsets inside the causal window."""
+    model, ds, cfg = _tiny_model_and_data()
+    S = qk_positional_circuit(model, 0, 0)
+    assert S.shape == (cfg.block_size, cfg.block_size)
+    prof = qk_offset_profile(model, 0, 0)
+    assert len(prof["offsets"]) == cfg.block_size - 1
+    assert (prof["offsets"] >= 0).all()          # argmax j <= i, so offset >= 0 (0 = self)
+    assert 0.0 <= prof["frac_offset_one"] <= 1.0
+
+
+def test_ov_circuit_shapes_and_profile_keys():
+    model, ds, cfg = _tiny_model_and_data()
+    write, to_logits = ov_circuit(model, 0, 0)
+    assert write.shape == (cfg.vocab_size, cfg.n_embd)
+    assert to_logits.shape == (cfg.vocab_size, cfg.vocab_size)
+    prof = ov_copy_profile(model, 0, 0)
+    assert {"top1_logit", "top1_embed", "rank", "sep_ratio"} <= set(prof)
+    assert prof["rank"] <= cfg.n_embd // cfg.n_head    # OV is rank-limited by head size

@@ -25,33 +25,14 @@ _DEFAULT_CORPUS = Path(__file__).resolve().parent.parent / "data" / "input.txt"
 
 
 class CharTokenizer:
-    """Character-level tokenizer: a bijection between the characters present in a
-    corpus and the integers ``0 .. vocab_size-1``.
+    """Character-level tokenizer — a bijection between the corpus alphabet and
+    ``0 .. vocab_size-1``. ``encode``/``decode`` are exact inverses on that alphabet.
 
-    Mathematical operation
-    -----------------------
-    ``encode``  maps a string ``s`` to ``[stoi[c] for c in s]``.
-    ``decode``  maps an integer list ``l`` to ``''.join(itos[i] for i in l)``.
-    The two are exact inverses on any string drawn from the fitted alphabet.
-
-    Why character-level
-    -------------------
-    The vocabulary is tiny — 65 symbols for Tiny Shakespeare — which makes the
-    embedding table and the final ``lm_head`` projection cheap (both scale with
-    ``vocab_size``). The cost is paid on the sequence-length axis: a character
-    model needs a longer context window to span the same number of *words* a
-    subword model would, and it must spend capacity learning orthography
-    (spelling, capitalization) that a BPE tokenizer gets for free. This is the
-    deliberate trade the teaching model makes — a transparent vocabulary at the
-    price of a harder modeling task per token.
-
-    Why fit the alphabet from the corpus rather than fixing it
-    ----------------------------------------------------------
-    ``sorted(set(text))`` guarantees a stable, deterministic ordering of symbols
-    every time the tokenizer is built from the same corpus, so a checkpoint's
-    embedding rows stay aligned with the same characters across machines. A
-    hard-coded ASCII table would waste rows on symbols the corpus never uses and
-    would silently break on any character it omits.
+    65 symbols for Tiny Shakespeare keeps the embedding table and ``lm_head`` cheap;
+    the cost is on the sequence axis (more positions per word, and capacity spent on
+    orthography a BPE tokenizer gets free). Fitting via ``sorted(set(text))`` gives a
+    deterministic symbol order, so a checkpoint's embedding rows stay aligned with
+    the same characters across machines.
     """
 
     def __init__(self, text: str):
@@ -140,35 +121,17 @@ def get_batch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample one mini-batch of ``(context, target)`` pairs.
 
-    Mathematical operation
-    -----------------------
-    Draw ``batch_size`` random start indices ``i``; for each, take
-    ``x = data[i : i+block_size]`` and ``y = data[i+1 : i+block_size+1]``. The
-    ``+1`` shift is the whole game: a single length-``T`` window is not one
-    training example but ``T`` of them, because position ``t`` predicts ``y[t]``
-    using only ``x[:t+1]``. One forward pass therefore produces ``B*T``
-    supervised next-token predictions — the source of the transformer's
-    training efficiency.
+    Draws ``batch_size`` random starts ``i``, taking ``x = data[i:i+T]`` and
+    ``y = data[i+1:i+T+1]``. The ``+1`` shift is the whole game: one length-``T``
+    window is ``T`` training examples, since position ``t`` predicts ``y[t]`` from
+    ``x[:t+1]`` alone — so one forward pass yields ``B*T`` supervised predictions.
+    The ``len(data) - block_size`` ceiling keeps the shifted target slice in bounds.
 
-    Shape walk
-    ----------
-        ix              : (B,)            random start offsets
-        x = stack(...)  : (B, T)          contexts
-        y = stack(...)  : (B, T)          targets, x shifted left by one
+    ``generator`` is required, not optional: the source samples from the global RNG
+    that evaluation also consumes, which silently couples the training trajectory to
+    eval cadence. See the README's implementation notes.
 
-    Why ``len(data) - block_size`` as the sampling ceiling
-    ------------------------------------------------------
-    A start index ``i`` needs ``i + block_size + 1`` valid positions to form a
-    full ``(x, y)`` pair. Capping ``randint`` at ``len(data) - block_size``
-    guarantees the target slice never runs off the end of the tensor.
-
-    Why an explicit ``generator``
-    -----------------------------
-    The source draws batches from the *global* RNG, which the evaluation loop
-    also consumes — so the training trajectory silently depends on how often you
-    evaluate. Passing a dedicated :class:`torch.Generator` decouples data
-    sampling from every other random op, making a run reproducible regardless of
-    eval cadence, dropout, or sampling temperature elsewhere in the program.
+        ix : (B,)     x : (B, T)     y : (B, T)   targets, x shifted left by one
     """
     data = dataset.train_data if split == "train" else dataset.val_data
     ix = torch.randint(

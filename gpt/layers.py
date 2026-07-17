@@ -1,20 +1,12 @@
-"""The transformer's modular primitives — a single attention head, multi-head
-attention, the position-wise feed-forward network, and the residual block that
-stacks them — each instrumented for the interpretability analysis.
+"""The transformer's modular primitives — attention head, multi-head attention,
+position-wise feed-forward, and the residual block that stacks them — each
+instrumented for the interpretability analysis.
 
-The instrumentation is the part Karpathy's original does not have, and it is
-what the analysis in ``notebooks/05_attention_analysis.ipynb`` runs on. Three
-hooks are threaded through these modules:
-
-* **attention capture** — a head can return its ``(T, T)`` attention matrix so
-  the analysis can characterize what each head attends to;
-* **head ablation** — multi-head attention can zero a chosen subset of heads to
-  measure each head's causal contribution to the loss;
-* **residual-stream access** — the block returns its post-attention and
-  post-block activations so the analysis can patch and read the residual stream.
-
-None of these change the trained weights or the forward computation when left
-inactive; they are pure observation/intervention surfaces.
+The instrumentation is what Karpathy's original lacks and what
+``notebooks/05_attention_analysis.ipynb`` runs on: attention capture, head
+ablation, head-output patching, and residual-stream access. All of it is inert
+unless the analysis switches it on — no hook changes the trained weights or the
+forward computation when unused.
 """
 
 from __future__ import annotations
@@ -28,17 +20,12 @@ from torch.nn import functional as F
 
 @dataclass
 class ActivationCache:
-    """A write-once container for the internal tensors a forward pass exposes.
+    """The internal tensors one forward pass exposes.
 
-    Mechanistic-interpretability work treats a transformer as a set of named
-    activations connected by a residual stream; the cache is the minimal version
-    of that idea. ``attn[layer]`` holds the per-head attention weights of block
-    ``layer``; ``resid[k]`` holds the residual stream *entering* block ``k``
-    (with ``resid[0]`` the post-embedding stream and ``resid[n_layer]`` the final
-    pre-``ln_f`` stream); ``head_out[layer]`` holds each head's output *before*
-    the output projection, which is what a head actually writes and therefore the
-    thing to splice in a head-level interchange intervention. The analysis reads
-    these instead of re-deriving them.
+    ``attn[layer]``: per-head attention weights. ``resid[k]``: the residual stream
+    entering block ``k`` (``0`` = post-embedding, ``n_layer`` = final pre-``ln_f``).
+    ``head_out[layer]``: each head's output *before* the output projection — what a
+    head actually writes, and so the thing to splice in a head-level intervention.
     """
 
     attn: dict[int, torch.Tensor] = field(default_factory=dict)      # layer -> (B, n_head, T, T)
@@ -47,41 +34,16 @@ class ActivationCache:
 
 
 class Head(nn.Module):
-    """One head of causal self-attention — a single content-based router.
+    """One head of causal self-attention — a content-based router.
 
-    Mathematical operation
-    -----------------------
-        k = x W_K,  q = x W_Q,  v = x W_V                       projections
-        A = softmax( (q kᵀ) / sqrt(d_head)  +  causal_mask )    affinities
-        out = A v                                               weighted gather
+    ``A = softmax(q k^T / sqrt(head_size) + causal_mask)``, then ``out = A v``: each
+    position emits a query, matches it against every key at or before it, and
+    gathers a convex combination of values. This is the only mechanism in the model
+    that moves information *between* positions.
 
-    Intuition (the database metaphor)
-    ---------------------------------
-    Every position emits a **query** ("what am I looking for?"), a **key** ("what
-    do I offer?"), and a **value** ("what will I hand over if selected?"). The
-    dot product ``q · k`` scores how well position *i*'s query matches position
-    *j*'s key; softmax turns those scores into a convex combination; the output
-    at *i* is that combination of the *values*. Attention is therefore a
-    differentiable, content-addressable lookup — the one mechanism in the model
-    where information moves *between* token positions.
-
-    Why divide by ``sqrt(d_head)``
-    ------------------------------
-    With unit-variance ``q`` and ``k`` and head dimension ``d``, the raw dot
-    product ``q · k`` has variance ``d``. Feeding variance-``d`` logits into
-    softmax makes it peaky — for ``d=16`` the largest logit dominates and the
-    distribution collapses toward one-hot, which zeros the gradient to every
-    non-selected position and stalls learning at initialization. Scaling by
-    ``1/sqrt(d)`` restores unit variance so softmax starts soft and stays
-    trainable. This is the "scaled" in scaled dot-product attention, and omitting
-    it is a silent training-killer rather than a loud crash.
-
-    Why a registered buffer for ``tril``
-    ------------------------------------
-    The lower-triangular causal mask is constant, not learned, but it must follow
-    the module across ``.to(device)`` and in/out of ``state_dict``. ``register_
-    buffer`` gives exactly that — device-tracked, persisted, but excluded from
-    ``parameters()`` so the optimizer never touches it.
+    The ``1/sqrt(head_size)`` scaling (not ``1/sqrt(n_embd)``) is load-bearing — see
+    the README's implementation notes. ``return_attn`` hands the pre-dropout ``(T, T)``
+    weights to the analysis.
     """
 
     def __init__(self, n_embd: int, head_size: int, block_size: int, dropout: float):
@@ -117,32 +79,17 @@ class Head(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Several attention heads in parallel, concatenated and projected.
+    """Several attention heads in parallel, concatenated and projected by ``W_O``.
 
-    Mathematical operation
-    -----------------------
-        out = Dropout( Concat(head_1, ..., head_h) W_O )
+    Each head gets ``n_embd // n_head`` dimensions and its own ``(W_Q, W_K, W_V)``,
+    so heads can specialize into different relations at the same parameter budget —
+    which is what makes "which head does the work?" a question worth asking.
 
-    Why multiple heads instead of one wide head
-    -------------------------------------------
-    Each head gets ``head_size = n_embd // n_head`` dimensions and learns its own
-    ``(W_Q, W_K, W_V)``, so heads can specialize into different relations — one
-    might track the previous character, another the start-of-line position,
-    another a longer-range dependency. A single head of the full width can only
-    represent *one* attention pattern per position; splitting the width buys
-    several patterns at the same parameter budget. The output projection ``W_O``
-    then mixes the per-head results back into the model dimension so the residual
-    stream stays width-``n_embd``.
-
-    The head-ablation and head-patching hooks
-    -----------------------------------------
-    ``ablate`` is a set of head indices whose outputs are zeroed before
-    concatenation — it reports how much the model *depends* on a head. ``patch_
-    heads`` goes further: it is a dict ``{head_idx: tensor}`` that *replaces* a
-    head's output with one supplied from elsewhere (typically the same head's
-    output on a clean input). Splicing one head's clean output into an otherwise
-    corrupted run isolates that single head's causal contribution, which ablation
-    (a coarse on/off) and residual-stream patching (which mixes all heads) cannot.
+    Two intervention hooks. ``ablate`` zeroes a set of heads before concatenation
+    (how much the model *depends* on a head). ``patch_heads`` replaces a head's
+    output with a supplied tensor (typically its own output on a clean input) —
+    splicing one head's clean output into a corrupted run isolates that head alone,
+    which neither ablation nor residual patching can do.
     """
 
     def __init__(self, n_embd: int, n_head: int, head_size: int, block_size: int, dropout: float):
@@ -185,29 +132,12 @@ class MultiHeadAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Position-wise MLP: the per-token "computation" half of a block.
+    """Position-wise MLP — the per-token "computation" half of a block.
 
-    Mathematical operation
-    -----------------------
-        FFN(x) = Dropout( max(0, x W_1 + b_1) W_2 + b_2 ),
-        with W_1: (n_embd, 4*n_embd) and W_2: (4*n_embd, n_embd).
-
-    Why it follows attention
-    ------------------------
-    Attention *moves* information between positions but applies no nonlinearity to
-    the gathered content beyond the value projection — on its own it is close to a
-    weighted average. The feed-forward network is where each token, now holding
-    context aggregated by attention, does private nonlinear processing on it.
-    The two-step rhythm "communicate (attention) then compute (FFN)" is the
-    defining motif of the transformer block.
-
-    Why the 4x expansion
-    --------------------
-    Projecting up to ``4*n_embd`` before the ReLU gives the nonlinearity a
-    higher-dimensional space to carve, then projecting back down keeps the
-    residual-stream width fixed. The 4x ratio is the convention inherited from
-    the original transformer; it is the cheapest knob that reliably adds
-    capacity without changing the stream geometry.
+    ``Dropout(max(0, x W_1 + b_1) W_2 + b_2)`` with a 4x inner expansion. Attention
+    moves information between positions but barely transforms it; the FFN is where
+    each token privately processes the context attention just gathered. Communicate,
+    then compute — the defining rhythm of the block.
     """
 
     def __init__(self, n_embd: int, dropout: float):
@@ -224,34 +154,13 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    """One transformer block: pre-norm attention and FFN, each wrapped in a
-    residual connection.
+    """One transformer block: ``x = x + MHA(LN(x))`` then ``x = x + FFN(LN(x))``.
 
-    Mathematical operation
-    -----------------------
-        x = x + MHA(LayerNorm(x))      communication, with skip
-        x = x + FFN(LayerNorm(x))      computation, with skip
-
-    Why pre-norm (LayerNorm *inside* the residual branch)
-    -----------------------------------------------------
-    Normalizing the *input* to each sub-layer, while leaving the skip path
-    ``x +`` un-normalized, keeps a clean identity highway running the full depth
-    of the network. Gradients flow back along that highway undistorted, which is
-    what lets a 4-layer stack train at all. The source uses this pre-norm
-    arrangement (LayerNorm before the sub-layer); the original 2017 transformer
-    put LayerNorm *after* the residual add, which is markedly harder to optimize
-    without learning-rate warmup.
-
-    Why two separate LayerNorms
-    ---------------------------
-    Attention and the FFN see different input statistics, so each gets its own
-    normalizer with its own learnable gain/bias rather than sharing one.
-
-    Cache / ablation pass-through
-    ----------------------------
-    When ``return_attn`` is set the block returns the per-head attention from its
-    attention sub-layer; ``ablate`` forwards a set of head indices to zero. These
-    are inert during ordinary training and only activate from the analysis code.
+    Pre-norm — LayerNorm inside each residual branch, skip path left clean — keeps
+    an identity highway running the full depth so gradients reach the early layers.
+    Attention and the FFN get separate LayerNorms since they see different input
+    statistics. ``return_attn``, ``ablate``, and ``patch_heads`` pass through to the
+    attention sub-layer for the analysis.
     """
 
     def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float):
